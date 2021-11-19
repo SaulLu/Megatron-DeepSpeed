@@ -17,7 +17,7 @@ from apex.optimizers import FusedAdam as Adam
 from apex.optimizers import FusedSGD as SGD
 
 from megatron import get_args
-from megatron.model import LayerNorm
+from megatron.model.fused_layer_norm import MixedFusedLayerNorm as LayerNorm
 
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
@@ -57,12 +57,8 @@ def get_megatron_optimizer(model):
     param_groups = _get_params_for_weight_decay_optimization(model)
     if args.optimizer == 'adam':
         if args.use_bnb_optimizer:
-            try:
-                import bitsandbytes as bnb
-                adam_optimizer = bnb.optim.Adam8bit
-            except ModuleNotFoundError:
-                print("Please install bitsandbytes following https://github.com/facebookresearch/bitsandbytes.")
-                raise Exception
+            import bitsandbytes as bnb
+            adam_optimizer = bnb.optim.Adam8bit
         else:
             adam_optimizer = Adam
         optimizer = adam_optimizer(param_groups,

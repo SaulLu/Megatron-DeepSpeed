@@ -22,7 +22,7 @@ from megatron import print_rank_0
 from megatron import get_timers
 from megatron import get_tokenizer
 from megatron import mpu
-from megatron.data.gpt_dataset import build_train_valid_test_datasets
+from megatron.data.gpt_dataset import build_train_valid_test_datasets, build_dataset_group
 from megatron.model import GPTModel, GPTModelPipe
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids, get_prefix_indices
@@ -64,7 +64,6 @@ def model_provider(pre_process=True, post_process=True):
 
             # must be bool or the training crashes expecting bool, but getting Half
             args.attn_mask = attention_mask.to(torch.bool)
-            args.attn_mask_original = attention_mask.to(torch.bool)
 
             model = GPTModelPipe(
                 num_tokentypes=0,
@@ -146,21 +145,13 @@ def get_batch_pipe(data):
         prefix_indices=None,
         loss_on_targets_only=args.loss_on_targets_only
     )
-    if args.curriculum_learning:
-        args.curriculum_seqlen = args.curriculum_scheduler.update_difficulty( \
-                    args.iteration + 1)
-        if args.curriculum_seqlen < tokens.size()[1]:
-            # seqlen-based curriculum learning
-            # tokens, position_ids, labels, loss_mask have size [batch size, seqlen]
-            tokens = tokens[:, :args.curriculum_seqlen].contiguous()
-            position_ids = position_ids[:, :args.curriculum_seqlen].contiguous()
-            labels = labels[:, :args.curriculum_seqlen].contiguous()
-            loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
-        actual_seqlen = tokens.size()[1]
-        if actual_seqlen != args.attn_mask.size()[2]:
-            # attention_mask has size [1, 1, seqlen, seqlen]
-            attention_mask = attention_mask[:, :, :actual_seqlen, :actual_seqlen].contiguous()
-            args.attn_mask = args.attn_mask_original[:, :, :actual_seqlen, :actual_seqlen].contiguous()
+    if args.curriculum_learning and args.curriculum_seqlen < tokens.size()[1]:
+        # seqlen-based curriculum learning
+        # tokens, position_ids, labels, loss_mask have size [batch size, seqlen]
+        tokens = tokens[:, :args.curriculum_seqlen].contiguous()
+        position_ids = position_ids[:, :args.curriculum_seqlen].contiguous()
+        labels = labels[:, :args.curriculum_seqlen].contiguous()
+        loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
 
     return (tokens, position_ids, attention_mask), (labels, loss_mask)
 
@@ -198,19 +189,50 @@ def forward_step(data_iterator, model):
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
+    train_ds, valid_ds, test_ds = None, None, None
 
-    print_rank_0('> building train, validation, and test datasets '
-                 'for GPT ...')
-    train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-        data_prefix=args.data_path,
-        data_impl=args.data_impl,
-        splits_string=args.split,
-        train_valid_test_num_samples=train_val_test_num_samples,
-        seq_length=args.seq_length,
-        seed=args.seed,
-        skip_warmup=(not args.mmap_warmup))
+    print_rank_0('> building train, validation, and test datasets for GPT ...')
+    # Option 1 of data loading using --data-path
+
+    if args.data_path:
+        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+            data_prefix=args.data_path,
+            data_impl=args.data_impl,
+            splits_string=args.split,
+            train_valid_test_num_samples=train_val_test_num_samples,
+            seq_length=args.seq_length,
+            seed=args.seed,
+            skip_warmup=(not args.mmap_warmup))
+    # Option 2 of data loading using --(train|valid|test)-weighted-split-paths
+    elif args.train_weighted_split_paths:
+        assigned_train_valid_test = []
+        if args.train_weighted_split_paths is not None:
+            train_ds = []
+            assigned_train_valid_test.append("train")
+        if args.valid_weighted_split_paths is not None:
+            valid_ds = []
+            assigned_train_valid_test.append("valid")
+        if args.test_weighted_split_paths is not None:
+            test_ds = []
+            assigned_train_valid_test.append("test")
+
+        for s in assigned_train_valid_test:
+            data_groups = zip(eval(f"args.{s}_weighted_split_paths"),
+                                eval(f"args.{s}_weighted_split_weights"),
+                                eval(f"args.{s}_weighted_split_splits"),
+                                eval(f"args.{s}_weighted_split_names"))
+            for paths, weights, splits, name in data_groups:
+                d = build_dataset_group(name, paths, weights, splits,
+                                        args.data_impl,
+                                        train_val_test_num_samples,
+                                        args.seq_length, args.seed,
+                                        (not args.mmap_warmup),
+                                        train_valid_test=s)
+                eval(f"{s}_ds").append(d)
+    else:
+        raise NotImplementedError("No dataloading argument passed")
+
     print_rank_0("> finished creating GPT datasets ...")
-
     return train_ds, valid_ds, test_ds
 
 
